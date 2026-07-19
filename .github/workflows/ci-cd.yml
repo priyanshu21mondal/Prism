@@ -1,0 +1,161 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+concurrency:
+  group: ci-cd-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  NODE_VERSION: "22"
+  CIRCOM_VERSION: "v2.2.3"
+
+jobs:
+  # Stage 1 — static analysis. Nothing downstream runs until types check out.
+  typecheck:
+    name: 1. Typecheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Typecheck app (tsc -b)
+        run: npx tsc -b
+      - name: Typecheck server + scripts
+        run: npm run typecheck:server
+
+  # Stage 2 — unit tests. Gated on typecheck passing.
+  test:
+    name: 2. Unit Tests
+    runs-on: ubuntu-latest
+    needs: typecheck
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  # Stage 3 — frontend production build. Gated on tests passing.
+  build:
+    name: 3. Frontend Build
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - run: npm run build
+        env:
+          VITE_BASE_PATH: /${{ github.event.repository.name }}/
+          VITE_CONTRACT_ID: ${{ vars.VITE_CONTRACT_ID || 'CA7Q75QFMA6JOZEEVACJARFERWFKUYBVL4XCA6ATXMXGACWE5U55ZSOJ' }}
+          VITE_PRISM_MARKET_CONTRACT_ID: ${{ vars.VITE_PRISM_MARKET_CONTRACT_ID || 'CA7Q75QFMA6JOZEEVACJARFERWFKUYBVL4XCA6ATXMXGACWE5U55ZSOJ' }}
+          VITE_TREASURY_ADDRESS: ${{ vars.VITE_TREASURY_ADDRESS || 'GCU6JX2SBD2JUAWAH5U54VOU3KPXMJO2YMFPM5OZNZFDABWW3TVGP4GW' }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+          retention-days: 7
+
+  # Stage 4 — ZK circuit compiles against the circom 2 toolchain. Gated on typecheck.
+  circuits:
+    name: 4. Circuit Compilation
+    runs-on: ubuntu-latest
+    needs: typecheck
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: npm
+      - run: npm ci
+      - name: Install circom ${{ env.CIRCOM_VERSION }}
+        run: |
+          mkdir -p "$HOME/.cargo/bin"
+          curl -fsSL -o "$HOME/.cargo/bin/circom" \
+            "https://github.com/iden3/circom/releases/download/${CIRCOM_VERSION}/circom-linux-amd64"
+          chmod +x "$HOME/.cargo/bin/circom"
+          circom --version
+      - name: Compile range_market.circom
+        run: |
+          mkdir -p build/circuits
+          circom circuits/range_market.circom --r1cs --wasm -o build/circuits -l node_modules
+      - name: Toolchain smoke test
+        run: npm run proof:smoke
+      - uses: actions/upload-artifact@v4
+        with:
+          name: circuit-artifacts
+          path: build/circuits
+          retention-days: 7
+
+  # Stage 5 — Soroban smart contract compiles to wasm and its test suite passes. Gated on typecheck.
+  contracts:
+    name: 5. Contract Build & Test
+    runs-on: ubuntu-latest
+    needs: typecheck
+    defaults:
+      run:
+        working-directory: contracts/prism_market
+    steps:
+      - uses: actions/checkout@v4
+      - name: Add wasm32v1-none target
+        run: rustup target add wasm32v1-none
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: contracts/prism_market
+      - name: Build release wasm
+        run: cargo build --release --target wasm32v1-none
+      - name: Run contract test suite
+        run: cargo test
+      - uses: actions/upload-artifact@v4
+        with:
+          name: contract-wasm
+          path: contracts/prism_market/target/wasm32v1-none/release/*.wasm
+          retention-days: 7
+
+  # Stage 6 — pipeline gate. A single required check that only goes green once every
+  # upstream stage (typecheck, tests, build, circuits, contracts) has passed.
+  pipeline-gate:
+    name: 6. Pipeline Gate
+    runs-on: ubuntu-latest
+    needs: [build, circuits, contracts]
+    steps:
+      - run: echo "All CI stages passed — build, circuits, and contracts are green."
+
+  # Stage 7 (CD) — publish the frontend to GitHub Pages. Only runs for pushes to
+  # main once the full pipeline is green; pull requests never deploy.
+  deploy:
+    name: 7. Deploy (GitHub Pages)
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    needs: pipeline-gate
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: frontend-dist
+          path: dist
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+      - id: deployment
+        uses: actions/deploy-pages@v4

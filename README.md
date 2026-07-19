@@ -436,6 +436,51 @@ SAC id (`XLM_TOKEN_CONTRACT_ID`) is a deterministic network
 constant and does not change between deployments on the same
 network.
 
+## CI/CD Pipeline
+
+Every push and pull request runs a seven-stage pipeline
+(`.github/workflows/ci-cd.yml`). Stages run sequentially —
+each one only starts after the previous stages it depends on
+are green — and the pipeline gate only passes once the
+frontend build, circuit compilation, and contract build/test
+have all succeeded. Pushes to `main` then deploy the built
+frontend to GitHub Pages.
+
+```mermaid
+flowchart LR
+    A["1. Typecheck\ntsc -b + server"] --> B["2. Unit Tests\nnode --test"]
+    B --> C["3. Frontend Build\nvite build"]
+    A --> D["4. Circuit Compilation\ncircom + proof:smoke"]
+    A --> E["5. Contract Build & Test\ncargo build/test (wasm32v1-none)"]
+    C --> F["6. Pipeline Gate"]
+    D --> F
+    E --> F
+    F -->|push to main| G["7. Deploy\nGitHub Pages"]
+
+    classDef stage fill:#1f2937,stroke:#4b5563,color:#f9fafb;
+    classDef gate fill:#7c3aed,stroke:#5b21b6,color:#f9fafb;
+    classDef deploy fill:#059669,stroke:#047857,color:#f9fafb;
+    class A,B,C,D,E stage;
+    class F gate;
+    class G deploy;
+```
+
+| Stage | What it checks | Failure blocks |
+| --- | --- | --- |
+| 1. Typecheck | `tsc -b` for the app, `tsc -p tsconfig.server.json` for the server/scripts | everything downstream |
+| 2. Unit Tests | `node --test` over `src/**/*.test.ts` (30 tests: commitment, payout tiers, wallet, resolvers, encryption) | build |
+| 3. Frontend Build | `vite build`, uploads `dist/` as a workflow artifact | pipeline gate |
+| 4. Circuit Compilation | Installs circom 2, compiles `range_market.circom` against `circomlib`, runs `npm run proof:smoke` | pipeline gate |
+| 5. Contract Build & Test | Adds the `wasm32v1-none` target, `cargo build --release` + `cargo test` for `contracts/prism_market` | pipeline gate |
+| 6. Pipeline Gate | Single required check — green only once 3, 4, and 5 all pass | deploy |
+| 7. Deploy | Publishes the built frontend to GitHub Pages | — (push to `main` only) |
+
+Scripts that require a funded testnet account and live secrets
+(`integration-test.ts`, `verifier-smoke-test.ts`, the
+`resolve:*` and `deploy-markets` scripts) are intentionally
+**not** part of CI — they're manual/local tools for working
+against a real deployment, not automatable checks.
+
 ## Built With
 
 - Circom + snarkjs (ZK proof generation)
