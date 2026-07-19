@@ -90,6 +90,29 @@ sequenceDiagram
 | Resolver service | Reads public Stellar data and posts settlement to the contract |
 | Horizon / DEX | Source data for the two live Stellar Metrics markets |
 
+### Event Streaming Architecture
+
+The contract emits typed Soroban events for the production
+indexing surface:
+
+| Event | Trigger | Frontend/indexer use |
+|---|---|---|
+| `initialized` | Contract constructor completes | Deployment verification |
+| `market_created` | Admin creates a market | Market catalog synchronization |
+| `pool_funded` | Funder adds market liquidity | Pool balance refresh |
+| `market_settled` | Resolver posts final value | Settlement and claim UI refresh |
+| `prediction_committed` | User seals a prediction | Live sealed-feed updates |
+| `claim_missed` | Claim range misses and records zero payout | Accuracy/accounting refresh |
+| `claim_paid` | Winning claim pays out net amount | Claim status and wallet refresh |
+
+The browser sync layer in
+[`src/lib/contract/event-stream.ts`](./src/lib/contract/event-stream.ts)
+keeps the UI current by running an immediate startup sync,
+polling the contract, resynchronizing when the network comes
+back online, and refreshing when a hidden tab becomes visible
+again. Concurrent refresh triggers are coalesced into one
+queued sync to avoid duplicate RPC pressure.
+
 ## Why Stellar Specifically
 
 **Stellar-native data:** PRISM's Stellar Metrics markets
@@ -138,7 +161,7 @@ key derivation.
 | XLM stake transfer to contract | Real — testnet |
 | Pool-based payout with 2% fee | Real — testnet |
 | Duplicate claim prevention via nullifier | Real |
-| Settlement rejection for missed ranges | Real |
+| Missed-claim replay prevention | Real — missed claims record a zero-payout nullifier |
 | Horizon oracle for XLM payment volume | Real |
 | Horizon/SDEX oracle for XLM/USDC price | Real |
 | BN254 on-chain Groth16 proof verification | Not yet wired — see below |
@@ -470,7 +493,7 @@ flowchart LR
 | Stage | What it checks | Failure blocks |
 | --- | --- | --- |
 | 1. Typecheck | `tsc -b` for the app, `tsc -p tsconfig.server.json` for the server/scripts | everything downstream |
-| 2. Unit Tests | `node --test` over `src/**/*.test.ts` (30 tests: commitment, payout tiers, wallet, resolvers, encryption) | build |
+| 2. Unit Tests | `node --test` over `src/**/*.test.ts` (33 tests: commitment, payout tiers, wallet, resolvers, encryption, event streaming) | build |
 | 3. Frontend Build | `vite build`, uploads `dist/` as a workflow artifact | pipeline gate |
 | 4. Circuit Compilation | Installs circom 2, compiles `range_market.circom` against `circomlib`, runs `npm run proof:smoke` | pipeline gate |
 | 5. Contract Build & Test | Adds the `wasm32v1-none` target, `cargo build --release` + `cargo test` for `contracts/prism_market` | pipeline gate |
@@ -482,6 +505,38 @@ Scripts that require a funded testnet account and live secrets
 `resolve:*` and `deploy-markets` scripts) are intentionally
 **not** part of CI — they're manual/local tools for working
 against a real deployment, not automatable checks.
+
+## Verification Evidence
+
+Latest local verification:
+
+```text
+npm test
+1..33
+# tests 33
+# pass 33
+# fail 0
+
+cargo test
+running 4 tests
+test result: ok. 4 passed; 0 failed
+
+npm run build
+✓ built in 5.10s
+
+cargo build --release --target wasm32v1-none
+Finished release profile
+```
+
+Latest recorded testnet settlement evidence is committed in
+[`docs/deployments/latest-settlement.json`](./docs/deployments/latest-settlement.json):
+
+```text
+Contract: CA7Q75QFMA6JOZEEVACJARFERWFKUYBVL4XCA6ATXMXGACWE5U55ZSOJ
+Market: 3003
+Interaction tx: e93f97b581a1ec049c14713e58414d130995327902ee8c0cd850a618f8abff9b
+Explorer: https://stellar.expert/explorer/testnet/tx/e93f97b581a1ec049c14713e58414d130995327902ee8c0cd850a618f8abff9b
+```
 
 ## Built With
 

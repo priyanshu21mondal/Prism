@@ -1,7 +1,8 @@
 #![no_std]
 
 use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, token, Address, Bytes, BytesN, Env,
+    contract, contracterror, contractevent, contractimpl, contracttype, token, Address, Bytes,
+    BytesN, Env,
 };
 
 const STROOPS_PER_XLM: i128 = 10_000_000;
@@ -66,6 +67,59 @@ pub struct ClaimRecord {
     pub fee: i128,
 }
 
+#[contractevent]
+pub struct Initialized {
+    pub admin: Address,
+    pub xlm_token: Address,
+}
+
+#[contractevent]
+pub struct MarketCreated {
+    #[topic]
+    pub market_id: u64,
+    pub market: Market,
+}
+
+#[contractevent]
+pub struct PoolFunded {
+    #[topic]
+    pub market_id: u64,
+    pub funder: Address,
+    pub amount: i128,
+}
+
+#[contractevent]
+pub struct MarketSettled {
+    #[topic]
+    pub market_id: u64,
+    pub actual_value: i128,
+}
+
+#[contractevent]
+pub struct PredictionCommitted {
+    #[topic]
+    pub market_id: u64,
+    pub wallet: Address,
+    pub commitment_hash: BytesN<32>,
+    pub stake: i128,
+}
+
+#[contractevent]
+pub struct ClaimMissed {
+    #[topic]
+    pub market_id: u64,
+    pub wallet: Address,
+}
+
+#[contractevent]
+pub struct ClaimPaid {
+    #[topic]
+    pub market_id: u64,
+    pub wallet: Address,
+    pub payout: i128,
+    pub fee: i128,
+}
+
 #[contracttype]
 #[derive(Clone)]
 pub enum DataKey {
@@ -98,6 +152,9 @@ pub enum Error {
     BelowMinStake = 15,
     UnauthorizedResolver = 16,
     MarketNotReady = 17,
+    UnauthorizedAdmin = 18,
+    InvalidMarketConfig = 19,
+    EmptyEncryptedBlob = 20,
 }
 
 #[contract]
@@ -112,6 +169,7 @@ impl PrismMarketContract {
 
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::XlmToken, &xlm_token);
+        Initialized { admin, xlm_token }.publish(&env);
 
         Ok(())
     }
@@ -127,11 +185,14 @@ impl PrismMarketContract {
         treasury_address: Address,
         resolver_address: Address,
     ) -> Result<(), Error> {
-        require_admin(&env, &admin);
+        require_admin(&env, &admin)?;
 
         let key = DataKey::Market(market_id);
         if env.storage().persistent().has(&key) {
             return Err(Error::MarketExists);
+        }
+        if max_range_width == 0 || resolution_time == 0 {
+            return Err(Error::InvalidMarketConfig);
         }
 
         let market = Market {
@@ -159,6 +220,7 @@ impl PrismMarketContract {
         };
 
         env.storage().persistent().set(&key, &market);
+        MarketCreated { market_id, market }.publish(&env);
 
         Ok(())
     }
@@ -216,6 +278,7 @@ impl PrismMarketContract {
         market.settled = true;
         market.active = false;
         env.storage().persistent().set(&market_key, &market);
+        MarketSettled { market_id, actual_value }.publish(&env);
 
         Ok(())
     }
@@ -269,6 +332,12 @@ impl PrismMarketContract {
         if amount <= 0 {
             return Err(Error::InvalidStake);
         }
+        let market_key = DataKey::Market(market_id);
+        let mut market: Market = env
+            .storage()
+            .persistent()
+            .get(&market_key)
+            .ok_or(Error::MarketMissing)?;
 
         let token_address: Address = env
             .storage()
@@ -277,6 +346,9 @@ impl PrismMarketContract {
             .ok_or(Error::PoolMissing)?;
         let token_client = token::Client::new(&env, &token_address);
         token_client.transfer(&funder, &env.current_contract_address(), &amount);
+        market.total_pool += amount;
+        env.storage().persistent().set(&market_key, &market);
+        PoolFunded { market_id, funder, amount }.publish(&env);
 
         Ok(())
     }
@@ -362,6 +434,9 @@ fn commit_internal(
     if stake < market.min_stake {
         return Err(Error::BelowMinStake);
     }
+    if encrypted_blob.is_empty() {
+        return Err(Error::EmptyEncryptedBlob);
+    }
 
     let commitment_key = DataKey::Commitment(market_id, wallet.clone());
     if env.storage().persistent().has(&commitment_key) {
@@ -390,6 +465,13 @@ fn commit_internal(
     market.total_pool += stake;
     env.storage().persistent().set(&commitment_key, &record);
     env.storage().persistent().set(&market_key, &market);
+    PredictionCommitted {
+        market_id,
+        wallet: record.wallet.clone(),
+        commitment_hash: record.commitment_hash.clone(),
+        stake,
+    }
+    .publish(&env);
 
     Ok(())
 }
@@ -434,15 +516,22 @@ fn claim_internal(
         return Err(Error::InvalidCommitment);
     }
 
-    if market.actual_value < predicted_low || market.actual_value > predicted_high {
-        market.loser_count += 1;
-        env.storage().persistent().set(&market_key, &market);
-        return Err(Error::RangeMiss);
-    }
-
     let width = predicted_high - predicted_low;
     if width <= 0 || width > market.max_range_width as i128 {
         return Err(Error::InvalidRange);
+    }
+
+    if market.actual_value < predicted_low || market.actual_value > predicted_high {
+        commitment.claimed = true;
+        market.loser_count += 1;
+        market.claimed_count += 1;
+        env.storage().persistent().set(&commitment_key, &commitment);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Nullifier(market_id, wallet.clone()), &true);
+        env.storage().persistent().set(&market_key, &market);
+        ClaimMissed { market_id, wallet }.publish(&env);
+        return Ok(0);
     }
 
     let gross_payout = gross_payout_for_width(
@@ -494,6 +583,13 @@ fn claim_internal(
     env.storage()
         .persistent()
         .set(&DataKey::Claim(market_id, wallet), &claim);
+    ClaimPaid {
+        market_id,
+        wallet: claim.wallet,
+        payout: net_payout,
+        fee,
+    }
+    .publish(&env);
 
     Ok(net_payout)
 }
@@ -505,12 +601,13 @@ fn is_nullifier_used_internal(env: &Env, market_id: u64, wallet: Address) -> boo
         .unwrap_or(false)
 }
 
-fn require_admin(env: &Env, candidate: &Address) {
+fn require_admin(env: &Env, candidate: &Address) -> Result<(), Error> {
     let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
     candidate.require_auth();
     if admin != *candidate {
-        panic!("admin required");
+        return Err(Error::UnauthorizedAdmin);
     }
+    Ok(())
 }
 
 fn gross_payout_for_width(
@@ -533,4 +630,187 @@ fn gross_payout_for_width(
     };
 
     Ok(stake * multiplier)
+}
+
+#[cfg(test)]
+mod test {
+    extern crate std;
+
+    use super::*;
+    use soroban_sdk::{
+        testutils::{Address as _, Ledger},
+        token::StellarAssetClient,
+    };
+
+    const MARKET_ID: u64 = 42;
+    const INITIAL_BALANCE: i128 = 1_000 * STROOPS_PER_XLM;
+
+    struct Fixture {
+        env: Env,
+        client: PrismMarketContractClient<'static>,
+        token: token::Client<'static>,
+        contract_id: Address,
+        resolver: Address,
+        treasury: Address,
+        user: Address,
+        funder: Address,
+        commitment: BytesN<32>,
+    }
+
+    fn fixture() -> Fixture {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().with_mut(|ledger| ledger.timestamp = 1_000);
+
+        let admin = Address::generate(&env);
+        let resolver = Address::generate(&env);
+        let treasury = Address::generate(&env);
+        let user = Address::generate(&env);
+        let funder = Address::generate(&env);
+        let token_admin = Address::generate(&env);
+        let token_id = env.register_stellar_asset_contract_v2(token_admin.clone()).address();
+        let asset = StellarAssetClient::new(&env, &token_id);
+        asset.mint(&user, &INITIAL_BALANCE);
+        asset.mint(&funder, &INITIAL_BALANCE);
+
+        let contract_id = env.register(
+            PrismMarketContract,
+            (admin.clone(), token_id.clone()),
+        );
+        let client = PrismMarketContractClient::new(&env, &contract_id);
+        client.create_market(
+            &admin,
+            &MARKET_ID,
+            &1_000,
+            &10,
+            &(5 * STROOPS_PER_XLM),
+            &2_000,
+            &treasury,
+            &resolver,
+        );
+
+        Fixture {
+            token: token::Client::new(&env, &token_id),
+            contract_id,
+            commitment: BytesN::from_array(&env, &[7; 32]),
+            env,
+            client,
+            resolver,
+            treasury,
+            user,
+            funder,
+        }
+    }
+
+    fn encrypted_blob(env: &Env) -> Bytes {
+        Bytes::from_array(env, b"{\"ciphertext\":\"demo\"}")
+    }
+
+    #[test]
+    fn create_market_persists_configuration() {
+        let fixture = fixture();
+        let market = fixture.client.get_market(&MARKET_ID);
+
+        assert_eq!(market.id, MARKET_ID);
+        assert_eq!(market.active, true);
+        assert_eq!(market.resolver_address, fixture.resolver);
+        assert_eq!(market.treasury_address, fixture.treasury);
+    }
+
+    #[test]
+    fn commit_prediction_transfers_stake_and_updates_stats() {
+        let fixture = fixture();
+        let stake = 10 * STROOPS_PER_XLM;
+
+        fixture.client.commit_prediction(
+            &fixture.user,
+            &MARKET_ID,
+            &fixture.commitment,
+            &encrypted_blob(&fixture.env),
+            &stake,
+        );
+
+        let record = fixture.client.get_commitment(&MARKET_ID, &fixture.user);
+        let stats = fixture.client.get_market_stats(&MARKET_ID);
+        assert_eq!(record.stake, stake);
+        assert_eq!(stats.sealed_count, 1);
+        assert_eq!(stats.total_pool, stake);
+        assert_eq!(fixture.token.balance(&fixture.contract_id), stake);
+    }
+
+    #[test]
+    fn resolver_settles_and_winner_claims_net_payout_once() {
+        let fixture = fixture();
+        let stake = 10 * STROOPS_PER_XLM;
+        let pool_top_up = 200 * STROOPS_PER_XLM;
+
+        fixture.client.commit_prediction(
+            &fixture.user,
+            &MARKET_ID,
+            &fixture.commitment,
+            &encrypted_blob(&fixture.env),
+            &stake,
+        );
+        fixture.client.fund_pool(&fixture.funder, &MARKET_ID, &pool_top_up);
+        fixture.env.ledger().with_mut(|ledger| ledger.timestamp = 2_001);
+        fixture.client.settle_market(&fixture.resolver, &MARKET_ID, &550);
+
+        let payout = fixture.client.claim_winnings(
+            &fixture.user,
+            &MARKET_ID,
+            &500,
+            &600,
+            &BytesN::from_array(&fixture.env, &[1; 32]),
+            &fixture.commitment,
+        );
+
+        assert_eq!(payout, 882 * STROOPS_PER_XLM / 10);
+        let claim = fixture.client.get_claim(&MARKET_ID, &fixture.user);
+        let stats = fixture.client.get_market_stats(&MARKET_ID);
+        assert_eq!(claim.payout, payout);
+        assert_eq!(claim.fee, 18 * STROOPS_PER_XLM / 10);
+        assert_eq!(stats.winner_count, 1);
+        assert_eq!(stats.claimed_count, 1);
+        assert_eq!(fixture.client.is_nullifier_used(&MARKET_ID, &fixture.user), true);
+    }
+
+    #[test]
+    fn missed_claim_consumes_nullifier_to_prevent_replay_accounting() {
+        let fixture = fixture();
+        let stake = 10 * STROOPS_PER_XLM;
+
+        fixture.client.commit_prediction(
+            &fixture.user,
+            &MARKET_ID,
+            &fixture.commitment,
+            &encrypted_blob(&fixture.env),
+            &stake,
+        );
+        fixture.env.ledger().with_mut(|ledger| ledger.timestamp = 2_001);
+        fixture.client.settle_market(&fixture.resolver, &MARKET_ID, &900);
+
+        let first = fixture.client.claim_winnings(
+            &fixture.user,
+            &MARKET_ID,
+            &500,
+            &600,
+            &BytesN::from_array(&fixture.env, &[1; 32]),
+            &fixture.commitment,
+        );
+        assert_eq!(first, 0);
+
+        let replay = fixture.client.try_claim_winnings(
+            &fixture.user,
+            &MARKET_ID,
+            &500,
+            &600,
+            &BytesN::from_array(&fixture.env, &[1; 32]),
+            &fixture.commitment,
+        );
+        assert_eq!(replay, Err(Ok(Error::AlreadyClaimed)));
+
+        let stats = fixture.client.get_market_stats(&MARKET_ID);
+        assert_eq!(stats.loser_count, 1);
+        assert_eq!(stats.claimed_count, 1);
+    }
 }

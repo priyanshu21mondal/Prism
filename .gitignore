@@ -2,6 +2,7 @@ node_modules/
 dist/
 build/
 contracts/**/target/
+contracts/**/test_snapshots/
 src/generated/*/node_modules/
 src/generated/*/dist/
 .env

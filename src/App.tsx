@@ -58,6 +58,7 @@ import {
   type SealedPrediction,
   type TransactionResult,
 } from "@/lib/contract/prism-market";
+import { createContractEventStream } from "@/lib/contract/event-stream";
 import {
   cryptoPriceMarkets,
   formatOutcomeValue,
@@ -507,11 +508,17 @@ function App() {
       }
     }
 
-    void refreshMarkets();
-    const interval = window.setInterval(refreshMarkets, 10_000);
+    const stream = createContractEventStream({
+      pollMs: 10_000,
+      onSync: refreshMarkets,
+      onError: (error) => console.warn("Unable to refresh contract event stream", error),
+      onlineTarget: window,
+      visibilityDocument: document,
+    });
+    stream.start();
     return () => {
       cancelled = true;
-      window.clearInterval(interval);
+      stream.stop();
     };
   }, [selectedMarket.numericId, wallet.address]);
 
