@@ -1,0 +1,27 @@
+{
+  "compilerOptions": {
+    "allowImportingTsExtensions": true,
+    "esModuleInterop": true,
+    "lib": ["ES2022", "DOM"],
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "skipLibCheck": true,
+    "strict": true,
+    "target": "ES2022",
+    "types": ["node"],
+    "baseUrl": ".",
+    "paths": {
+      "@/*": ["./src/*"]
+    }
+  },
+  "include": [
+    "server/**/*.ts",
+    "scripts/create-crypto-markets.ts",
+    "scripts/resolve-crypto-price.ts",
+    "scripts/resolve-xlm-payments.ts",
+    "scripts/resolve-xlm-usdc-price.ts",
+    "src/generated/prism-market/src/**/*.ts",
+    "src/lib/resolver/**/*.ts"
+  ]
+}
