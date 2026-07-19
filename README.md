@@ -438,6 +438,8 @@ network.
 
 ## CI/CD Pipeline
 
+<img width="1464" height="803" alt="Screenshot 2026-07-19 at 12 44 50 PM" src="https://github.com/user-attachments/assets/60a307bc-ffc5-44b0-b7a5-b8493a4d3b72" />
+
 Every push and pull request runs a seven-stage pipeline
 (`.github/workflows/ci-cd.yml`). Stages run sequentially —
 each one only starts after the previous stages it depends on
